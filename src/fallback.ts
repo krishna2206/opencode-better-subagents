@@ -1,8 +1,9 @@
 /**
- * Subagent execution wrapper implementing candidate fallback,
- * circuit breaking, and cleanup of failed child sessions.
+ * Subagent execution wrapper implementing catalog filtering, candidate fallback,
+ * circuit breaking, background run tracking, and cleanup of failed child sessions.
  */
 
+import { Model } from "@opencode/plugin";
 import type { BetterSubagentsConfig } from "./config.js";
 import type { CircuitBreaker } from "./circuit-breaker.js";
 
@@ -15,10 +16,48 @@ export interface SubagentToolInput {
   background?: boolean;
 }
 
+export interface CatalogModelEntry {
+  readonly id: string;
+  readonly providerID: string;
+  readonly enabled?: boolean;
+  readonly type?: string;
+  readonly variants?: ReadonlyArray<{ readonly id: string }>;
+}
+
+export interface SubagentExecutorDeps {
+  readonly removeSession?: (sessionID: string) => Promise<void>;
+  readonly listModels?: () => Promise<ReadonlyArray<CatalogModelEntry>>;
+  readonly onRunningSession?: (sessionID: string, model: string) => void;
+}
+
+const NON_RETRYABLE_PATTERNS = [
+  "subagent cancelled",
+  "aborterror",
+  "user cancelled",
+  "subagent denied:",
+  "subagent depth limit reached",
+  "parent session not found:",
+  "unknown agent:",
+  "cannot run as a subagent",
+  "subagent session not found:",
+  "is not a child of the current session",
+];
+
 export function isCancelledError(error: unknown): boolean {
   if (!error) return false;
   const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
   return msg.includes("subagent cancelled") || msg.includes("aborterror") || msg.includes("user cancelled");
+}
+
+/**
+ * Returns true when an error comes from cancellation, permissions, depth limits,
+ * or invalid caller arguments rather than the selected model/provider.
+ * Retrying another model on these errors would fail identically and poison cooldowns.
+ */
+export function isNonRetryableSubagentError(error: unknown): boolean {
+  if (!error) return false;
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return NON_RETRYABLE_PATTERNS.some((pattern) => msg.includes(pattern));
 }
 
 export function extractFailedSessionID(error: unknown): string | null {
@@ -26,6 +65,52 @@ export function extractFailedSessionID(error: unknown): string | null {
   const msg = error instanceof Error ? error.message : String(error);
   const match = msg.match(/sessionID:\s*([a-zA-Z0-9_-]+)/i);
   return match ? match[1]! : null;
+}
+
+/**
+ * Filters a candidate chain against OpenCode's active chat model catalog so
+ * disabled providers or missing variants are skipped upfront without wasted retries.
+ */
+export function filterCatalogCandidates(
+  chain: readonly string[],
+  catalog: ReadonlyArray<CatalogModelEntry>,
+): string[] {
+  return chain.filter((candidate) => {
+    let ref: Model.Ref;
+    try {
+      ref = Model.Ref.parse(candidate);
+    } catch {
+      return false;
+    }
+
+    const match = catalog.find(
+      (m) =>
+        m.providerID === ref.providerID &&
+        m.id === ref.id &&
+        m.enabled !== false &&
+        (m.type === undefined || m.type === "chat"),
+    );
+    if (!match) return false;
+
+    if (ref.variant !== undefined) {
+      const variants = match.variants ?? [];
+      if (!variants.some((v) => v.id === ref.variant)) return false;
+    }
+
+    return true;
+  });
+}
+
+function isRunningResult(input: SubagentToolInput, result: any): boolean {
+  if (input.background === true) return true;
+  if (result?.output?.status === "running") return true;
+  if (result?.metadata?.status === "running") return true;
+  return false;
+}
+
+function extractRunningSessionID(result: any): string | null {
+  const id = result?.output?.sessionID ?? result?.metadata?.sessionID;
+  return typeof id === "string" && id.length > 0 ? id : null;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -37,7 +122,7 @@ export function createSubagentExecutor(
   originalExecute: (input: any, context: any) => Promise<any>,
   config: BetterSubagentsConfig,
   circuitBreaker: CircuitBreaker,
-  removeSession?: (sessionID: string) => Promise<void>,
+  deps: SubagentExecutorDeps = {},
 ) {
   return async function executeWithFallback(input: SubagentToolInput, context: any): Promise<any> {
     const rawAgent = input.agent?.trim();
@@ -57,30 +142,61 @@ export function createSubagentExecutor(
       return await originalExecute(input, context);
     }
 
-    // 4. Resolve candidate chain and filter out cooled-down models
-    const chain = config.agents[rawAgent]!;
-    const candidates = circuitBreaker.pickCandidates(chain);
+    // 4. Filter configured chain against currently enabled catalog models when available
+    const configuredChain = config.agents[rawAgent]!;
+    let availableChain: readonly string[] = configuredChain;
+
+    if (deps.listModels) {
+      let catalog: ReadonlyArray<CatalogModelEntry> | undefined;
+      try {
+        catalog = await deps.listModels();
+      } catch {
+        // Catalog query failed transiently: fall back to the configured list
+      }
+      if (catalog !== undefined) {
+        const filtered = filterCatalogCandidates(configuredChain, catalog);
+        if (filtered.length === 0) {
+          throw new Error(
+            `No configured fallback model for subagent '${rawAgent}' is currently available in OpenCode catalog (${configuredChain.join(", ")})`,
+          );
+        }
+        availableChain = filtered;
+      }
+    }
+
+    // 5. Filter out cooled-down models (falls back to availableChain if all are cooling down)
+    const candidates = circuitBreaker.pickCandidates(availableChain);
 
     let lastError: unknown;
 
     for (let i = 0; i < candidates.length; i++) {
       const candidateModel = candidates[i]!;
 
-      // Check for caller-side abort before launching next candidate
       if (context?.signal?.aborted) {
         throw new Error("Subagent execution aborted");
       }
 
       try {
         const result = await originalExecute({ ...input, model: candidateModel }, context);
-        // Succeeded on this model: clear any prior cooldown
+
+        // Background or mid-run backgrounded subagents return immediately with status="running"
+        // before the LLM call completes: track completion asynchronously via session events
+        // instead of clearing cooldown prematurely.
+        if (isRunningResult(input, result)) {
+          const runningSessionID = extractRunningSessionID(result);
+          if (runningSessionID && deps.onRunningSession) {
+            deps.onRunningSession(runningSessionID, candidateModel);
+          }
+          return result;
+        }
+
         circuitBreaker.markSuccess(candidateModel);
         return result;
       } catch (err) {
         lastError = err;
 
-        // Never retry if cancelled by user or caller signal
-        if (context?.signal?.aborted || isCancelledError(err)) {
+        // Never retry or penalize models on user abort, permission denial, depth limit, or caller validation errors
+        if (context?.signal?.aborted || isNonRetryableSubagentError(err)) {
           throw err;
         }
 
@@ -89,11 +205,10 @@ export function createSubagentExecutor(
 
         // Clean up failed child session if one was created
         const failedChildSession = extractFailedSessionID(err);
-        if (failedChildSession && removeSession) {
-          void removeSession(failedChildSession).catch(() => {});
+        if (failedChildSession && deps.removeSession) {
+          void deps.removeSession(failedChildSession).catch(() => {});
         }
 
-        // If there are more candidates to try, log and continue
         if (i + 1 < candidates.length) {
           const nextCandidate = candidates[i + 1]!;
           console.warn(
