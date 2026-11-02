@@ -1,0 +1,35 @@
+{
+  "name": "opencode-better-subagents",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenCode plugin: configurable subagent model fallback chains with circuit breaker and failed-session cleanup.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test tests"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.2.5",
+    "@types/node": "^26.1.2",
+    "typescript": "7.0.2"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.2.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "license": "MIT"
+}
